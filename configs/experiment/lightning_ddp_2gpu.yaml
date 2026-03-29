@@ -1,8 +1,8 @@
 # @package _global_
 
 data:
-  num_samples: 6000000
-  num_cells_to_mask: 24
+  num_samples: 7000000
+  num_cells_to_mask: 48
   dataset_path: datasets/pretrain_default.pt
   seed: 123
   unique_solution: false

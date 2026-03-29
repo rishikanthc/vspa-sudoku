@@ -20,7 +20,9 @@ class DifficultyMetrics:
     empty_cells: int
     avg_cell_accuracy: float
     board_solved_rate: float
+    unsolved_board_count: int
     example_failed_board: Tensor | None = None
+    example_failed_confidence: Tensor | None = None
 
 
 def build_difficulty_levels(config: DictConfig) -> list[int]:
@@ -123,14 +125,30 @@ def infer_filled_board(
     encoder: Encoder,
     representation: SudokuRepresentation,
     puzzle: Tensor,
-) -> Tensor:
+    temperature: float,
+) -> tuple[Tensor, Tensor]:
+    if temperature <= 0.0:
+        raise ValueError("evaluation.inference.temperature must be positive")
+
     encoded = encoder(puzzle)
-    logits = representation.logits_from_predictions(encoded, puzzle)
+    coord_vecs = representation.encode_coordinates(puzzle)
+    digit_estimate = torch.nn.functional.normalize(encoded * coord_vecs, dim=-1)
+    prototypes = torch.nn.functional.normalize(
+        representation.digit_prototypes().to(digit_estimate.device),
+        dim=-1,
+    )
+    logits = torch.einsum("bsd,vd->bsv", digit_estimate, prototypes) / temperature
+    confidence = torch.softmax(logits, dim=-1).amax(dim=-1)
     pred_digits = logits.argmax(dim=-1).to(dtype=puzzle.dtype) + 1.0
     filled = puzzle.clone()
     empty_mask = filled[..., 2].eq(0)
     filled[..., 2] = torch.where(empty_mask, pred_digits, filled[..., 2])
-    return filled
+    prediction_confidence = torch.where(
+        empty_mask,
+        confidence.to(dtype=puzzle.dtype),
+        torch.full_like(confidence, float("nan"), dtype=puzzle.dtype),
+    )
+    return filled, prediction_confidence
 
 
 def run_multi_pass_inference(
@@ -139,30 +157,40 @@ def run_multi_pass_inference(
     puzzle: Tensor,
     clue_mask: Tensor,
     max_passes: int,
+    temperature: float,
     progress: tqdm | None = None,
-) -> tuple[Tensor, Tensor, list[Tensor], list[Tensor]]:
+) -> tuple[Tensor, Tensor, Tensor, list[Tensor], list[Tensor], list[Tensor]]:
     if max_passes <= 0:
         raise ValueError("evaluation.inference.max_passes must be positive")
 
     current_puzzle = puzzle.clone()
     original_clues = clue_mask[..., 0].to(dtype=torch.bool)
     final_board = current_puzzle.clone()
+    final_confidence = torch.full_like(puzzle[..., 2], float("nan"))
     solved = torch.zeros(puzzle.shape[0], dtype=torch.bool, device=puzzle.device)
     board_history: list[Tensor] = []
+    confidence_history: list[Tensor] = []
     solved_history: list[Tensor] = []
 
     for pass_idx in range(max_passes):
-        final_board = infer_filled_board(encoder, representation, current_puzzle)
+        final_board, final_confidence = infer_filled_board(
+            encoder,
+            representation,
+            current_puzzle,
+            temperature,
+        )
         digits = final_board[..., 2].to(dtype=torch.long)
         violations = find_constraint_violations(digits)
         solved = digits.ne(0).all(dim=-1) & ~violations.any(dim=-1)
         board_history.append(final_board.clone())
+        confidence_history.append(final_confidence.clone())
         solved_history.append(solved.clone())
         if progress is not None:
             progress.update(1)
         if solved.all():
             for _ in range(pass_idx + 1, max_passes):
                 board_history.append(final_board.clone())
+                confidence_history.append(final_confidence.clone())
                 solved_history.append(solved.clone())
                 if progress is not None:
                     progress.update(1)
@@ -177,7 +205,7 @@ def run_multi_pass_inference(
             updated,
         )
 
-    return final_board, solved, board_history, solved_history
+    return final_board, final_confidence, solved, board_history, confidence_history, solved_history
 
 
 def evaluate_difficulty(
@@ -191,6 +219,7 @@ def evaluate_difficulty(
     pin_memory: bool,
     seed: int,
     max_passes: int,
+    temperature: float,
     device: torch.device,
 ) -> DifficultyMetrics:
     dataset = SudokuPuzzleDataset(
@@ -213,6 +242,7 @@ def evaluate_difficulty(
     total_sum = 0.0
     solved_sum = 0.0
     example_failed_board: Tensor | None = None
+    example_failed_confidence: Tensor | None = None
     pass_correct_sum = [0.0 for _ in range(max_passes)]
     pass_total_sum = [0.0 for _ in range(max_passes)]
     pass_solved_sum = [0.0 for _ in range(max_passes)]
@@ -231,12 +261,13 @@ def evaluate_difficulty(
             target = target.to(device)
             clue_mask = clue_mask.to(device)
 
-            final_board, solved, board_history, solved_history = run_multi_pass_inference(
+            final_board, final_confidence, solved, board_history, confidence_history, solved_history = run_multi_pass_inference(
                 encoder=encoder,
                 representation=representation,
                 puzzle=puzzle,
                 clue_mask=clue_mask,
                 max_passes=max_passes,
+                temperature=temperature,
                 progress=progress,
             )
 
@@ -252,9 +283,15 @@ def evaluate_difficulty(
             if example_failed_board is None:
                 failed_indices = torch.nonzero(~solved, as_tuple=False).reshape(-1)
                 if failed_indices.numel() > 0:
-                    example_failed_board = final_board[failed_indices[0]].detach().cpu()
+                    failed_idx = int(failed_indices[0].item())
+                    example_failed_board = final_board[failed_idx].detach().cpu()
+                    # Show confidence from the first pass over the original puzzle,
+                    # so every originally empty cell has a confidence value.
+                    example_failed_confidence = confidence_history[0][failed_idx].detach().cpu()
 
-            for pass_idx, (pass_board, pass_solved) in enumerate(zip(board_history, solved_history, strict=True)):
+            for pass_idx, (pass_board, pass_solved) in enumerate(
+                zip(board_history, solved_history, strict=True)
+            ):
                 pass_pred_digits = pass_board[..., 2].to(dtype=torch.long)
                 pass_correct = pass_pred_digits.eq(target_digits) & eval_mask
                 pass_correct_sum[pass_idx] += float(pass_correct.sum().item())
@@ -266,19 +303,24 @@ def evaluate_difficulty(
     for pass_idx in range(max_passes):
         pass_accuracy = pass_correct_sum[pass_idx] / max(pass_total_sum[pass_idx], 1.0)
         pass_solved_rate = pass_solved_sum[pass_idx] / float(solutions.shape[0])
+        pass_unsolved = int(solutions.shape[0] - pass_solved_sum[pass_idx])
         print(
             f"  pass={pass_idx + 1} "
             f"avg_cell_accuracy={pass_accuracy:.6f} "
-            f"board_solved_rate={pass_solved_rate:.6f}"
+            f"board_solved_rate={pass_solved_rate:.6f} "
+            f"unsolved_board_count={pass_unsolved}"
         )
 
     avg_cell_accuracy = correct_sum / max(total_sum, 1.0)
     board_solved_rate = solved_sum / float(solutions.shape[0])
+    unsolved_board_count = int(solutions.shape[0] - solved_sum)
     return DifficultyMetrics(
         empty_cells=empty_cells,
         avg_cell_accuracy=avg_cell_accuracy,
         board_solved_rate=board_solved_rate,
+        unsolved_board_count=unsolved_board_count,
         example_failed_board=example_failed_board,
+        example_failed_confidence=example_failed_confidence,
     )
 
 
@@ -294,6 +336,24 @@ def format_sudoku_board(board_xyz: Tensor) -> str:
         lines.append(f"| {' | '.join(chunks)} |")
         if (row_idx + 1) % 3 == 0:
             lines.append("+-------+-------+-------+")
+    return "\n".join(lines)
+
+
+def format_confidence_board(confidence: Tensor) -> str:
+    if confidence.shape != (81,):
+        raise ValueError(f"Expected confidence with shape (81,), got {tuple(confidence.shape)}.")
+
+    values = confidence.reshape(9, 9)
+    lines = ["+-------------------------+-------------------------+-------------------------+"]
+    for row_idx in range(9):
+        row: list[str] = []
+        for value in values[row_idx]:
+            scalar = float(value.item())
+            row.append("   .  " if torch.isnan(value) else f"{scalar:0.3f}")
+        chunks = [" ".join(row[col:col + 3]) for col in range(0, 9, 3)]
+        lines.append(f"| {' | '.join(chunks)} |")
+        if (row_idx + 1) % 3 == 0:
+            lines.append("+-------------------------+-------------------------+-------------------------+")
     return "\n".join(lines)
 
 
@@ -321,6 +381,7 @@ def evaluate_checkpoint(config: DictConfig) -> list[DifficultyMetrics]:
                 pin_memory=config.evaluation.data.pin_memory,
                 seed=config.seed,
                 max_passes=config.evaluation.inference.max_passes,
+                temperature=config.evaluation.inference.temperature,
                 device=device,
             )
         )

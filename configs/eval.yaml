@@ -16,7 +16,7 @@ model:
   dropout: 0.1
 
 evaluation:
-  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/pretrain.ckpt
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/pretrain-24.ckpt
   device: cuda
   data:
     dataset_path: datasets/pretrain_default.pt
@@ -26,7 +26,8 @@ evaluation:
     pin_memory: false
   difficulty:
     start: 16
-    stop: 28
+    stop: 24
     step: 4
   inference:
-    max_passes: 8
+    max_passes: 3
+    temperature: 0.25
