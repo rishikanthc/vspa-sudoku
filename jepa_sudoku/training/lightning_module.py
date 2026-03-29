@@ -7,15 +7,13 @@ import torch
 from torch import Tensor
 from torch.optim import Adam
 
-from jepa_sudoku.model.losses import cosine_contrastive_loss
-from jepa_sudoku.model.models import Encoder, Predictor, SudokuRepresentation
+from jepa_sudoku.model.losses import masked_cosine_loss
+from jepa_sudoku.model.models import Encoder, SudokuRepresentation
 
 
 @dataclass
 class LightningTrainConfig:
     learning_rate: float = 1e-3
-    non_target_weight: float = 1.0
-    non_target_margin: float = 0.2
     curriculum_enabled: bool = False
     curriculum_mode: str = "adaptive"
     curriculum_step: int = 1
@@ -29,71 +27,84 @@ class SudokuLightningModule(pl.LightningModule):
         self,
         *,
         encoder: Encoder,
-        predictor: Predictor,
         representation: SudokuRepresentation,
         config: LightningTrainConfig,
     ) -> None:
         super().__init__()
-        if encoder.representation is not predictor.representation:
-            raise ValueError("Encoder and predictor must share the same representation instance.")
         if encoder.representation is not representation:
-            raise ValueError("Pass the same representation instance used by encoder/predictor.")
+            raise ValueError("Pass the same representation instance used by the encoder.")
 
         self.encoder = encoder
-        self.predictor = predictor
         self.representation = representation
         self.config = config
         self.history: list[float] = []
-
         self._curriculum_plateau_counter = 0
         self._curriculum_best_loss = float("inf")
 
     def configure_optimizers(self) -> Adam:
-        return Adam(
-            list(self.encoder.parameters()) + list(self.predictor.parameters()),
-            lr=self.config.learning_rate,
-        )
+        return Adam(self.encoder.parameters(), lr=self.config.learning_rate)
 
-    def _shared_step(self, batch: tuple[Tensor, Tensor, Tensor]) -> tuple[Tensor, Tensor]:
-        puzzle, solution, query = batch
-        encoder_out = self.encoder(puzzle)
-        pred_vectors = self.predictor(query, encoder_out)
-        target_vectors = self.representation.encode_targets(solution)
-        loss = cosine_contrastive_loss(
-            pred_vectors,
-            target_vectors,
-            solution[..., 2],
-            self.representation.digit_prototypes(),
-            non_target_weight=self.config.non_target_weight,
-            margin=self.config.non_target_margin,
-        )
+    def _shared_step(
+        self, batch: tuple[Tensor, Tensor, Tensor]
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        puzzle, target, clue_mask = batch
+        optimize_mask = ~clue_mask[..., 0].to(dtype=torch.bool)
+        encoded = self.encoder(puzzle)
+        target_vectors = self.representation.encode_targets(target)
+        loss = masked_cosine_loss(encoded, target_vectors, optimize_mask)
 
-        pred_norm = torch.nn.functional.normalize(pred_vectors, dim=-1)
+        pred_norm = torch.nn.functional.normalize(encoded, dim=-1)
         target_norm = torch.nn.functional.normalize(target_vectors, dim=-1)
-        cosine_sim = (pred_norm * target_norm).sum(dim=-1).mean()
-        return loss, cosine_sim
+        cosine_per_cell = (pred_norm * target_norm).sum(dim=-1)
+
+        logits = self.representation.logits_from_predictions(encoded, target)
+        pred_digits = logits.argmax(dim=-1) + 1
+        target_digits = target[..., 2].to(dtype=torch.long)
+        correct = pred_digits.eq(target_digits)
+
+        mask_f = optimize_mask.to(dtype=encoded.dtype)
+        total = mask_f.sum().clamp_min(1.0)
+        avg_cosine = (cosine_per_cell * mask_f).sum() / total
+        avg_cell_accuracy = (correct.to(dtype=encoded.dtype) * mask_f).sum() / total
+
+        board_solved = torch.where(
+            optimize_mask.any(dim=-1),
+            correct.logical_or(~optimize_mask).all(dim=-1).to(dtype=encoded.dtype),
+            torch.ones(puzzle.shape[0], device=encoded.device, dtype=encoded.dtype),
+        ).mean()
+        return loss, avg_cosine, avg_cell_accuracy, board_solved
 
     def training_step(
         self, batch: tuple[Tensor, Tensor, Tensor], batch_idx: int
     ) -> dict[str, Tensor]:
-        loss, cosine_sim = self._shared_step(batch)
+        loss, avg_cosine, avg_cell_accuracy, board_solved = self._shared_step(batch)
         data_module = self.trainer.datamodule
         empty_cells = (
             float(data_module.current_num_cells_to_mask)
             if data_module is not None
-            else float(batch[2].shape[1])
+            else float((~batch[2][..., 0].to(dtype=torch.bool)).sum(dim=-1).float().mean().item())
         )
+
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(
-            "train_loss",
-            loss,
+            "train_avg_cosine_similarity",
+            avg_cosine,
             on_step=True,
             on_epoch=True,
             prog_bar=True,
             sync_dist=True,
         )
         self.log(
-            "train_cosine_similarity",
-            cosine_sim,
+            "train_avg_cell_accuracy",
+            avg_cell_accuracy,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train_board_solved_rate",
+            board_solved,
             on_step=True,
             on_epoch=True,
             prog_bar=True,
@@ -112,7 +123,9 @@ class SudokuLightningModule(pl.LightningModule):
         return {
             "loss": loss,
             "train_loss": loss.detach(),
-            "train_cosine_similarity": cosine_sim.detach(),
+            "train_avg_cosine_similarity": avg_cosine.detach(),
+            "train_avg_cell_accuracy": avg_cell_accuracy.detach(),
+            "train_board_solved_rate": board_solved.detach(),
             "empty_cells": torch.tensor(empty_cells, device=loss.device),
         }
 
@@ -183,9 +196,6 @@ class SudokuLightningModule(pl.LightningModule):
         data_module.set_num_cells_to_mask(new_num_cells)
         self._curriculum_plateau_counter = 0
         self._curriculum_best_loss = float("inf")
-        trainer = getattr(self, "_trainer", None)
-        if trainer is None or getattr(trainer, "is_global_zero", True):
-            print(f"Curriculum update -> empty_cells={new_num_cells}")
 
     def on_train_epoch_end(self) -> None:
         train_loss = self._metric_to_float("train_loss")

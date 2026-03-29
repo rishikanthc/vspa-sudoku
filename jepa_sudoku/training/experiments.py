@@ -6,12 +6,12 @@ from typing import Any
 import lightning.pytorch as pl
 import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import MLFlowLogger
 from omegaconf import DictConfig, OmegaConf
 
 from jepa_sudoku.data.datamodule import LinearMaskCurriculum, SudokuDataConfig
-from jepa_sudoku.model.models import Encoder, Predictor, SudokuRepresentation, TransformerConfig
+from jepa_sudoku.model.models import Encoder, SudokuRepresentation, TransformerConfig
 
-from .csv_logger import StepMetricCSVLogger
 from .lightning_data import LightningSudokuDataModule
 from .lightning_module import LightningTrainConfig, SudokuLightningModule
 
@@ -40,8 +40,6 @@ ONE_BATCH_OVERFIT_OVERRIDES: dict[str, Any] = {
     "training": {
         "max_epochs": 2000,
         "learning_rate": 1e-4,
-        "non_target_weight": 1.0,
-        "non_target_margin": 0.2,
     },
     "trainer": {
         "accelerator": "cpu",
@@ -76,8 +74,7 @@ def build_data_config(data_config: DictConfig, curriculum_config: DictConfig) ->
 
     if curriculum_config.enabled and curriculum_config.mode not in {"linear", "adaptive"}:
         raise ValueError(
-            f"Unsupported curriculum.mode={curriculum_config.mode}. "
-            "Use 'linear' or 'adaptive'."
+            f"Unsupported curriculum.mode={curriculum_config.mode}. Use 'linear' or 'adaptive'."
         )
 
     resolved = SudokuDataConfig(
@@ -99,7 +96,7 @@ def build_data_config(data_config: DictConfig, curriculum_config: DictConfig) ->
     return resolved
 
 
-def build_components(config: DictConfig) -> tuple[SudokuRepresentation, Encoder, Predictor]:
+def build_components(config: DictConfig) -> tuple[SudokuRepresentation, Encoder]:
     transformer_config = TransformerConfig(
         context_size=config.model.context_size,
         n_heads=config.model.n_heads,
@@ -118,15 +115,12 @@ def build_components(config: DictConfig) -> tuple[SudokuRepresentation, Encoder,
         seed=config.ssp.seed,
     )
     encoder = Encoder(transformer_config, representation=representation)
-    predictor = Predictor(transformer_config, representation=representation)
-    return representation, encoder, predictor
+    return representation, encoder
 
 
 def build_train_config(config: DictConfig) -> LightningTrainConfig:
     return LightningTrainConfig(
         learning_rate=config.training.learning_rate,
-        non_target_weight=config.training.non_target_weight,
-        non_target_margin=config.training.non_target_margin,
         curriculum_enabled=config.curriculum.enabled,
         curriculum_mode=config.curriculum.mode,
         curriculum_step=config.curriculum.step,
@@ -147,10 +141,9 @@ def build_data_module(config: DictConfig) -> LightningSudokuDataModule:
 
 
 def build_lightning_module(config: DictConfig) -> SudokuLightningModule:
-    representation, encoder, predictor = build_components(config)
+    representation, encoder = build_components(config)
     return SudokuLightningModule(
         encoder=encoder,
-        predictor=predictor,
         representation=representation,
         config=build_train_config(config),
     )
@@ -167,8 +160,24 @@ def _build_callbacks(config: DictConfig) -> list[pl.Callback]:
         auto_insert_metric_name=False,
         enable_version_counter=False,
     )
-    csv_callback = StepMetricCSVLogger(config.logging.csv_path)
-    return [checkpoint_callback, csv_callback]
+    return [checkpoint_callback]
+
+
+def _build_mlflow_logger(config: DictConfig) -> MLFlowLogger:
+    try:
+        import mlflow  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "MLflow logging is required for training. Install the 'mlflow' package first."
+        ) from exc
+
+    return MLFlowLogger(
+        experiment_name=config.logging.mlflow_experiment_name,
+        run_name=config.logging.mlflow_run_name,
+        tracking_uri=config.logging.mlflow_tracking_uri,
+        save_dir=config.logging.mlflow_save_dir,
+        log_model=False,
+    )
 
 
 def build_trainer(config: DictConfig) -> pl.Trainer:
@@ -186,7 +195,7 @@ def build_trainer(config: DictConfig) -> pl.Trainer:
         fast_dev_run=config.trainer.fast_dev_run,
         limit_train_batches=config.trainer.limit_train_batches,
         callbacks=_build_callbacks(config),
-        logger=False,
+        logger=_build_mlflow_logger(config),
         enable_model_summary=False,
     )
 

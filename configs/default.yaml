@@ -12,8 +12,8 @@ model:
   context_size: 81
   n_heads: 2
   head_dim: 256
-  n_layers: 2
-  d_ff: 1024
+  n_layers: 8
+  d_ff: 512
   dropout: 0.1
 
 data:
@@ -41,8 +41,6 @@ curriculum:
 training:
   max_epochs: 1
   learning_rate: 1e-4
-  non_target_weight: 1.0
-  non_target_margin: 0.2
 
 checkpoint:
   dirpath: ${hydra:runtime.cwd}/checkpoints
@@ -51,7 +49,10 @@ checkpoint:
   mode: min
 
 logging:
-  csv_path: ${hydra:runtime.cwd}/logs/pretrain_metrics.csv
+  mlflow_tracking_uri: http://127.0.0.1:5000
+  mlflow_save_dir: ${hydra:runtime.cwd}/mlruns
+  mlflow_experiment_name: jepa-sudoku-pretrain
+  mlflow_run_name: pretrain
 
 trainer:
   accelerator: "cpu"

@@ -1,84 +1,45 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from jepa_sudoku.model.models import Encoder, Predictor, TransformerConfig
-from jepa_sudoku.model.ssp import ThreeAxisSSP, ThreeAxisSSPConfig
+from jepa_sudoku.model.models import Encoder, SudokuRepresentation, TransformerConfig
 
 
-def _model_config() -> tuple[TransformerConfig, ThreeAxisSSPConfig]:
-    transformer_config = TransformerConfig(
+def _build_components() -> tuple[SudokuRepresentation, Encoder]:
+    config = TransformerConfig(
         context_size=81,
-        n_heads=4,
+        n_heads=2,
         head_dim=16,
         n_layers=1,
         d_ff=64,
         dropout=0.0,
     )
-    embedding_config = ThreeAxisSSPConfig(
-        dim=transformer_config.d_model,
-        seed=123,
-    )
-    return transformer_config, embedding_config
+    representation = SudokuRepresentation(d_model=config.d_model, seed=123)
+    encoder = Encoder(config, representation=representation)
+    return representation, encoder
 
 
-def test_encoder_outputs_expected_shape_and_backprop() -> None:
-    b = 4
-    transformer_config, embedding_config = _model_config()
-    embedding = ThreeAxisSSP(embedding_config).to("cpu")
-    model = Encoder(transformer_config, embedding=embedding).to("cpu")
-    x = torch.randint(low=1, high=10, size=(b, 81, 2), dtype=torch.float32)
-    z = torch.randint(low=0, high=10, size=(b, 81, 1), dtype=torch.float32)
-    x = torch.cat([x, z], dim=-1)
+def test_representation_encodes_empty_cells_as_coordinates_only() -> None:
+    representation, _ = _build_components()
+    board = torch.tensor([[[1.0, 1.0, 0.0], [1.0, 2.0, 7.0]]])
 
-    out = model(x)
-    assert out.shape == (b, 81, transformer_config.d_model)
+    encoded = representation.encode_board(board)
+    coords = representation.encode_coordinates(board)
+    targets = representation.encode_targets(board)
 
-    loss = out.pow(2).mean()
-    loss.backward()
-
-    assert any(
-        param.grad is not None for param in model.parameters() if param.requires_grad
-    )
+    assert torch.allclose(encoded[:, :1], coords[:, :1], atol=1e-6)
+    assert torch.allclose(encoded[:, 1:], targets[:, 1:], atol=1e-6)
 
 
-def test_predictor_outputs_expected_shape_and_backprop() -> None:
-    b = 3
-    t = 12
-    transformer_config, embedding_config = _model_config()
-    embedding = ThreeAxisSSP(embedding_config).to("cpu")
-    predictor = Predictor(transformer_config, embedding=embedding).to("cpu")
+def test_encoder_outputs_full_board_vectors_and_decodes_digits() -> None:
+    representation, encoder = _build_components()
+    board = torch.zeros(2, 81, 3)
+    xy = torch.cartesian_prod(torch.arange(1, 10), torch.arange(1, 10)).float()
+    board[:, :, :2] = xy
+    board[:, :, 2] = 0
 
-    query = torch.randint(low=1, high=10, size=(b, t, 2), dtype=torch.float32)
-    z = torch.randint(low=0, high=10, size=(b, t, 1), dtype=torch.float32)
-    query = torch.cat([query, z], dim=-1)
-    encoder_out = torch.randn(
-        b, 81, transformer_config.d_model, requires_grad=True, dtype=torch.float32
-    )
+    encoded = encoder(board)
+    logits = representation.logits_from_predictions(representation.encode_targets(board + torch.tensor([0.0, 0.0, 1.0])), board)
 
-    out = predictor(query, encoder_out)
-    assert out.shape == (b, t, transformer_config.d_model)
-
-    loss = out.abs().mean()
-    loss.backward()
-
-    assert any(
-        param.grad is not None for param in predictor.parameters() if param.requires_grad
-    )
-
-
-def test_encoder_and_predictor_share_embedding_instance() -> None:
-    transformer_config, embedding_config = _model_config()
-    embedding = ThreeAxisSSP(embedding_config).to("cpu")
-
-    encoder = Encoder(transformer_config, embedding=embedding).to("cpu")
-    predictor = Predictor(transformer_config, embedding=embedding).to("cpu")
-
-    assert encoder.embedding is predictor.embedding
+    assert encoded.shape == (2, 81, representation.d_model)
+    assert logits.shape == (2, 81, 9)

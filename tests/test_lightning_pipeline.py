@@ -1,18 +1,23 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import torch
 from hydra import compose, initialize_config_dir
 
+import jepa_sudoku.training.experiments as experiments
 from jepa_sudoku.training.experiments import run_training_experiment
 
 
-def test_lightning_pretraining_pipeline_saves_checkpoint(tmp_path) -> None:
+def test_lightning_pretraining_pipeline_runs_and_saves_checkpoint(tmp_path, monkeypatch) -> None:
     config_dir = str(Path(__file__).resolve().parent.parent / "configs")
     dataset_path = tmp_path / "pretrain_dataset.pt"
     torch.save(
         {"solution_boards": torch.randint(1, 10, (4, 81), dtype=torch.uint8)},
         dataset_path,
     )
+
+    monkeypatch.setattr(experiments, "_build_mlflow_logger", lambda config: False)
 
     with initialize_config_dir(version_base=None, config_dir=config_dir):
         config = compose(
@@ -31,7 +36,6 @@ def test_lightning_pretraining_pipeline_saves_checkpoint(tmp_path) -> None:
                 "trainer.limit_train_batches=1",
                 f"checkpoint.dirpath={tmp_path}",
                 "checkpoint.filename=pretrain-test",
-                f"logging.csv_path={tmp_path / 'pretrain-metrics.csv'}",
             ],
         )
 
@@ -40,11 +44,3 @@ def test_lightning_pretraining_pipeline_saves_checkpoint(tmp_path) -> None:
     assert result.history
     assert result.checkpoint_path is not None
     assert Path(result.checkpoint_path).exists()
-    csv_path = tmp_path / "pretrain-metrics.csv"
-    assert csv_path.exists()
-    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
-    assert (
-        lines[0]
-        == "epoch,batch_idx,global_step,train_loss,train_cosine_similarity,empty_cells"
-    )
-    assert len(lines) >= 2

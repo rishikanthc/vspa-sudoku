@@ -19,52 +19,27 @@ def cosine_loss(
 
     cos_sim = einsum(a, b, "b s d, b s d -> b s")
     losses = 1.0 - cos_sim
-
-    loss = reduce(losses, "b s ->", "mean")
-    return loss
+    return reduce(losses, "b s ->", "mean")
 
 
-def cosine_contrastive_loss(
+def masked_cosine_loss(
     pred_vectors: Float[Tensor, "b s d"],
     target_vectors: Float[Tensor, "b s d"],
-    target_digits: Tensor,
-    digit_prototypes: Float[Tensor, "v d"],
-    *,
-    non_target_weight: float = 1.0,
-    margin: float = 0.2,
+    include_mask: Tensor,
     eps: float = 1e-8,
 ) -> Float[Tensor, ""]:
-    if non_target_weight < 0.0:
-        raise ValueError("non_target_weight must be non-negative.")
-    if margin < 0.0:
-        raise ValueError("margin must be non-negative.")
-
-    attraction = cosine_loss(pred_vectors, target_vectors, eps=eps)
-
-    if pred_vectors.numel() == 0 or non_target_weight == 0.0:
-        return attraction
+    if include_mask.ndim != 2:
+        raise ValueError(f"Expected include_mask with shape (B, S), got {tuple(include_mask.shape)}.")
 
     pred_norm = pred_vectors / torch.linalg.norm(
         pred_vectors, dim=-1, keepdim=True
     ).clamp_min(eps)
-    prototypes_norm = digit_prototypes / torch.linalg.norm(
-        digit_prototypes, dim=-1, keepdim=True
+    target_norm = target_vectors / torch.linalg.norm(
+        target_vectors, dim=-1, keepdim=True
     ).clamp_min(eps)
-    similarities = torch.einsum("bsd,vd->bsv", pred_norm, prototypes_norm)
 
-    target_indices = target_digits.to(dtype=torch.long) - 1
-    if target_indices.numel() > 0:
-        min_class = int(target_indices.min().item())
-        max_class = int(target_indices.max().item())
-        if min_class < 0 or max_class >= digit_prototypes.shape[0]:
-            raise ValueError(
-                "target_digits must index valid digit prototypes."
-            )
-
-    wrong_mask = torch.ones_like(similarities, dtype=torch.bool)
-    wrong_mask.scatter_(-1, target_indices.unsqueeze(-1), False)
-    wrong_similarities = similarities.masked_select(wrong_mask).reshape(
-        *similarities.shape[:2], similarities.shape[-1] - 1
-    )
-    repulsion = torch.relu(wrong_similarities - margin).mean()
-    return attraction + (non_target_weight * repulsion)
+    cos_sim = einsum(pred_norm, target_norm, "b s d, b s d -> b s")
+    losses = 1.0 - cos_sim
+    include_mask = include_mask.to(device=losses.device, dtype=losses.dtype)
+    denom = include_mask.sum().clamp_min(1.0)
+    return (losses * include_mask).sum() / denom
