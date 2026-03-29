@@ -77,6 +77,17 @@ def load_precomputed_solutions(dataset_path: str) -> Tensor:
     return solutions.contiguous().to(device="cpu")
 
 
+def select_solution_subset(solution_boards: Tensor, num_samples: int) -> Tensor:
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+    available = int(solution_boards.shape[0])
+    if num_samples > available:
+        raise ValueError(
+            f"Requested num_samples={num_samples}, but dataset only has {available} solution boards."
+        )
+    return solution_boards[:num_samples].contiguous()
+
+
 class SudokuPuzzleDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     """
     Dataset yielding:
@@ -101,9 +112,11 @@ class SudokuPuzzleDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
             raise ValueError("num_cells_to_mask must be between 0 and 81 inclusive")
 
         self._solution_boards = (
-            solution_boards.contiguous().to(device="cpu") if solution_boards is not None else None
+            select_solution_subset(solution_boards.to(device="cpu"), num_samples)
+            if solution_boards is not None
+            else None
         )
-        self.num_samples = int(solution_boards.shape[0]) if solution_boards is not None else num_samples
+        self.num_samples = num_samples
         self.num_cells_to_mask = num_cells_to_mask
         self.seed = int(seed)
         self.unique_solution = unique_solution
