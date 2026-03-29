@@ -29,5 +29,9 @@ evaluation:
     stop: 24
     step: 4
   inference:
-    max_passes: 3
+    max_passes: 8
     temperature: 0.25
+  local_repair:
+    enabled: true
+    max_component_size: 8
+    max_candidates_per_cell: 4
