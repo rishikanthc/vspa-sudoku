@@ -1,0 +1,32 @@
+defaults:
+  - _self_
+
+seed: 123
+
+ssp:
+  dim: 512
+  seed: 42
+
+model:
+  context_size: 81
+  n_heads: 2
+  head_dim: 256
+  n_layers: 8
+  d_ff: 512
+  dropout: 0.1
+
+evaluation:
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/pretrain.ckpt
+  device: cuda
+  data:
+    dataset_path: datasets/pretrain_default.pt
+    num_samples: 10000
+    batch_size: 128
+    num_workers: 0
+    pin_memory: false
+  difficulty:
+    start: 16
+    stop: 28
+    step: 4
+  inference:
+    max_passes: 8
