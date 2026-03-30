@@ -11,30 +11,25 @@ from jepa_sudoku.data.datamodule import (
 )
 
 
-def test_dataset_returns_full_board_target_and_mask() -> None:
+def test_dataset_returns_sparse_puzzle_targets_and_queries() -> None:
     dataset = SudokuPuzzleDataset(
         num_samples=2,
         num_cells_to_mask=10,
         seed=123,
         randomize_mask_per_access=False,
     )
-    puzzle, target, mask = dataset[0]
+    puzzle, target, queries = dataset[0]
 
-    assert puzzle.shape == (81, 3)
-    assert target.shape == (81, 3)
-    assert mask.shape == (81, 3)
-    assert mask.dtype == torch.bool
+    assert puzzle.shape == (71, 3)
+    assert target.shape == (10, 3)
+    assert queries.shape == (10, 2)
 
-    assert torch.equal(puzzle[:, :2], target[:, :2])
-    assert torch.equal(mask[:, 0], mask[:, 1])
-    assert torch.equal(mask[:, 1], mask[:, 2])
-    assert int((~mask[:, 0]).sum()) == 10
-    assert torch.all(puzzle[mask[:, 0], 2] >= 1)
-    assert torch.all(puzzle[~mask[:, 0], 2] == 0)
+    assert torch.all(puzzle[:, 2] >= 1)
     assert torch.all(target[:, 2] >= 1)
+    assert torch.equal(target[:, :2], queries)
 
 
-def test_datamodule_batches_full_board_contract() -> None:
+def test_datamodule_batches_sparse_contract() -> None:
     module = SudokuDataModule(
         SudokuDataConfig(
             num_samples=8,
@@ -45,12 +40,12 @@ def test_datamodule_batches_full_board_contract() -> None:
             shuffle=False,
         )
     )
-    batch_puzzle, batch_target, batch_mask = next(iter(module.train_dataloader()))
+    batch_puzzle, batch_target, batch_queries = next(iter(module.train_dataloader()))
 
-    assert batch_puzzle.shape == (4, 81, 3)
-    assert batch_target.shape == (4, 81, 3)
-    assert batch_mask.shape == (4, 81, 3)
-    assert int((~batch_mask[..., 0]).sum(dim=1).unique().item()) == 6
+    assert batch_puzzle.shape == (4, 75, 3)
+    assert batch_target.shape == (4, 6, 3)
+    assert batch_queries.shape == (4, 6, 2)
+    assert torch.equal(batch_target[..., :2], batch_queries)
 
 
 def test_precomputed_dataset_respects_num_samples_limit(tmp_path) -> None:

@@ -4,8 +4,9 @@ import torch
 
 from jepa_sudoku.evaluation import (
     find_constraint_violations,
+    format_sudoku_board,
+    jointly_decode_conflict_groups,
     load_holdout_solutions,
-    repair_conflict_clusters,
 )
 
 
@@ -46,35 +47,53 @@ def test_find_constraint_violations_marks_duplicate_groups() -> None:
     assert violations[0, 74]
 
 
-def test_repair_conflict_clusters_can_fix_small_connected_component() -> None:
+def test_format_sudoku_board_marks_cells_that_differ_from_solution() -> None:
+    solved = torch.zeros((81, 3), dtype=torch.float32)
+    board = torch.zeros((81, 3), dtype=torch.float32)
+    xy = torch.cartesian_prod(torch.arange(1, 10), torch.arange(1, 10)).float()
+    solved[:, :2] = xy
+    board[:, :2] = xy
+    solved[:, 2] = 1.0
+    board[:, 2] = 1.0
+    board[10, 2] = 2.0
+
+    rendered = format_sudoku_board(board, solved)
+
+    assert "[2]" in rendered
+    assert "Legend: cells in [brackets] differ from the solution." in rendered
+
+
+def test_jointly_decode_conflict_groups_fixes_two_cell_swap() -> None:
     board = torch.tensor(
         [
-            2, 4, 7, 5, 8, 6, 3, 9, 1,
-            1, 6, 9, 7, 3, 4, 8, 2, 5,
-            5, 8, 3, 9, 1, 2, 4, 6, 7,
-            4, 7, 8, 1, 6, 5, 9, 3, 2,
-            6, 2, 1, 4, 9, 3, 5, 5, 8,
-            9, 3, 5, 8, 2, 7, 1, 4, 6,
-            8, 5, 2, 3, 7, 9, 6, 1, 4,
-            7, 9, 4, 6, 5, 1, 2, 8, 3,
-            3, 1, 6, 2, 4, 8, 5, 5, 9,
+            5, 9, 6, 4, 8, 2, 7, 1, 3,
+            1, 7, 8, 3, 9, 5, 6, 2, 4,
+            4, 2, 3, 6, 1, 7, 5, 8, 9,
+            2, 3, 7, 1, 5, 8, 9, 4, 6,
+            9, 1, 4, 2, 6, 3, 8, 5, 7,
+            6, 8, 5, 7, 4, 9, 1, 3, 2,
+            3, 4, 9, 8, 7, 1, 2, 6, 8,
+            8, 5, 2, 9, 3, 6, 4, 7, 1,
+            7, 6, 1, 5, 2, 4, 3, 9, 5,
         ],
         dtype=torch.long,
     )
-    logits = torch.zeros((81, 9), dtype=torch.float32)
-    logits[43, 6] = 5.0  # r5c8 -> 7
-    logits[79, 4] = 5.0  # r9c8 -> 5
-    original_clues = torch.zeros(81, dtype=torch.bool)
+    logits = torch.full((81, 9), -10.0, dtype=torch.float32)
+    logits[62, 4] = 4.9
+    logits[62, 7] = 5.0
+    logits[80, 4] = 5.0
+    logits[80, 7] = 4.9
+    original_clues = torch.ones(81, dtype=torch.bool)
+    original_clues[62] = False
+    original_clues[80] = False
     violations = find_constraint_violations(board.unsqueeze(0))[0]
 
-    repaired = repair_conflict_clusters(
-        board_digits=board,
-        logits=logits,
-        original_clues=original_clues,
-        violations=violations,
-        max_component_size=6,
-        max_candidates_per_cell=4,
+    decoded = jointly_decode_conflict_groups(
+        board,
+        logits,
+        original_clues,
+        violations,
     )
 
-    assert int(repaired[43].item()) == 7
-    assert int(repaired[79].item()) == 5
+    assert int(decoded[62].item()) == 5
+    assert int(decoded[80].item()) == 8

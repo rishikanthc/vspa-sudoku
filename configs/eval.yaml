@@ -8,15 +8,23 @@ ssp:
   seed: 42
 
 model:
-  context_size: 81
-  n_heads: 2
-  head_dim: 256
-  n_layers: 8
-  d_ff: 512
-  dropout: 0.1
+  encoder:
+    context_size: 81
+    n_heads: 2
+    head_dim: 256
+    n_layers: 8
+    d_ff: 512
+    dropout: 0.1
+  predictor:
+    context_size: 81
+    n_heads: 2
+    head_dim: 256
+    n_layers: 8
+    d_ff: 512
+    dropout: 0.1
 
 evaluation:
-  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/pretrain-24.ckpt
+  checkpoint_path: ${hydra:runtime.cwd}/checkpoints/pretrain.ckpt
   device: cuda
   data:
     dataset_path: datasets/pretrain_default.pt
@@ -29,9 +37,8 @@ evaluation:
     stop: 24
     step: 4
   inference:
-    max_passes: 8
+    max_passes: 1
     temperature: 0.25
-  local_repair:
-    enabled: true
-    max_component_size: 8
-    max_candidates_per_cell: 4
+  joint_decoding:
+    max_component_size: 16
+    top_k_per_cell: 5

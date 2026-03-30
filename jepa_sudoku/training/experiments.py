@@ -10,7 +10,7 @@ from lightning.pytorch.loggers import MLFlowLogger
 from omegaconf import DictConfig, OmegaConf
 
 from jepa_sudoku.data.datamodule import LinearMaskCurriculum, SudokuDataConfig
-from jepa_sudoku.model.models import Encoder, SudokuRepresentation, TransformerConfig
+from jepa_sudoku.model.models import Encoder, Predictor, SudokuRepresentation, TransformerConfig
 
 from .lightning_data import LightningSudokuDataModule
 from .lightning_module import LightningTrainConfig, SudokuLightningModule
@@ -96,26 +96,36 @@ def build_data_config(data_config: DictConfig, curriculum_config: DictConfig) ->
     return resolved
 
 
-def build_components(config: DictConfig) -> tuple[SudokuRepresentation, Encoder]:
-    transformer_config = TransformerConfig(
-        context_size=config.model.context_size,
-        n_heads=config.model.n_heads,
-        head_dim=config.model.head_dim,
-        n_layers=config.model.n_layers,
-        d_ff=config.model.d_ff,
-        dropout=config.model.dropout,
+def _build_transformer_config(model_config: DictConfig) -> TransformerConfig:
+    return TransformerConfig(
+        context_size=model_config.context_size,
+        n_heads=model_config.n_heads,
+        head_dim=model_config.head_dim,
+        n_layers=model_config.n_layers,
+        d_ff=model_config.d_ff,
+        dropout=model_config.dropout,
     )
-    if config.ssp.dim != transformer_config.d_model:
+
+
+def build_components(config: DictConfig) -> tuple[SudokuRepresentation, Encoder, Predictor]:
+    encoder_config = _build_transformer_config(config.model.encoder)
+    predictor_config = _build_transformer_config(config.model.predictor)
+    if encoder_config.d_model != predictor_config.d_model:
         raise ValueError(
-            f"ssp.dim ({config.ssp.dim}) must match model d_model ({transformer_config.d_model})."
+            "Encoder and predictor must use the same d_model so they can share the representation."
+        )
+    if config.ssp.dim != encoder_config.d_model:
+        raise ValueError(
+            f"ssp.dim ({config.ssp.dim}) must match model d_model ({encoder_config.d_model})."
         )
 
     representation = SudokuRepresentation(
-        d_model=transformer_config.d_model,
+        d_model=encoder_config.d_model,
         seed=config.ssp.seed,
     )
-    encoder = Encoder(transformer_config, representation=representation)
-    return representation, encoder
+    encoder = Encoder(encoder_config)
+    predictor = Predictor(predictor_config)
+    return representation, encoder, predictor
 
 
 def build_train_config(config: DictConfig) -> LightningTrainConfig:
@@ -141,9 +151,10 @@ def build_data_module(config: DictConfig) -> LightningSudokuDataModule:
 
 
 def build_lightning_module(config: DictConfig) -> SudokuLightningModule:
-    representation, encoder = build_components(config)
+    representation, encoder, predictor = build_components(config)
     return SudokuLightningModule(
         encoder=encoder,
+        predictor=predictor,
         representation=representation,
         config=build_train_config(config),
     )

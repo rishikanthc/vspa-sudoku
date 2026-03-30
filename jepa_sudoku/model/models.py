@@ -25,6 +25,14 @@ class TransformerConfig:
         return self.n_heads * self.head_dim
 
 
+def _expand_attention_mask(mask: Tensor | None, target_length: int) -> Tensor | None:
+    if mask is None:
+        return None
+    if mask.ndim != 2:
+        raise ValueError(f"Expected attention mask with shape (B, S), got {tuple(mask.shape)}.")
+    return mask[:, None, None, :].expand(-1, 1, target_length, -1)
+
+
 class SudokuRepresentation(nn.Module):
     def __init__(self, d_model: int, seed: int):
         super().__init__()
@@ -87,12 +95,8 @@ class SudokuRepresentation(nn.Module):
     ) -> Float[Tensor, "b s d"]:
         coord_vecs = self.encode_coordinates(board_xyz)
         digits = board_xyz[..., 2]
-        encoded = coord_vecs.clone()
-        digit_mask = digits.ne(0)
-        if digit_mask.any():
-            digit_vecs = self._lookup_digit_vectors(digits[digit_mask])
-            encoded[digit_mask] = self.bind(coord_vecs[digit_mask], digit_vecs)
-        return encoded
+        digit_vecs = self._lookup_digit_vectors(digits)
+        return self.bind(coord_vecs, digit_vecs)
 
     def encode_targets(
         self, solution_xyz: Float[Tensor, "b s 3"]
@@ -100,9 +104,9 @@ class SudokuRepresentation(nn.Module):
         return self.encode_board(solution_xyz)
 
     def candidate_vectors(
-        self, coordinates_xyz: Float[Tensor, "b s 3"]
+        self, coordinates: Float[Tensor, "b s c"]
     ) -> Float[Tensor, "b s v d"]:
-        coord_vecs = self.encode_coordinates(coordinates_xyz)
+        coord_vecs = self.encode_coordinates(coordinates)
         digit_vecs = self.digit_prototypes().to(coord_vecs.device)
         bound = coord_vecs.unsqueeze(-2) * digit_vecs.unsqueeze(0).unsqueeze(0)
         return self._normalize(bound)
@@ -110,17 +114,17 @@ class SudokuRepresentation(nn.Module):
     def logits_from_predictions(
         self,
         pred_vectors: Float[Tensor, "b s d"],
-        coordinates_xyz: Float[Tensor, "b s 3"],
+        coordinates: Float[Tensor, "b s c"],
         logit_scale: float = 1.0,
     ) -> Float[Tensor, "b s 9"]:
         if logit_scale <= 0.0:
             raise ValueError(f"logit_scale must be positive, got {logit_scale}.")
         normalized_pred = self._normalize(pred_vectors)
-        candidates = self.candidate_vectors(coordinates_xyz)
+        candidates = self.candidate_vectors(coordinates)
         return logit_scale * torch.einsum("bsd,bsvd->bsv", normalized_pred, candidates)
 
 
-class SA(nn.Module):
+class SelfAttention(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.d_model = config.d_model
@@ -133,7 +137,11 @@ class SA(nn.Module):
         self.drop2 = nn.Dropout(config.dropout)
         self.out_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
-    def forward(self, x: Float[Tensor, "b s d"]) -> Float[Tensor, "b s d"]:
+    def forward(
+        self,
+        x: Float[Tensor, "b s d"],
+        key_padding_mask: Tensor | None = None,
+    ) -> Float[Tensor, "b s d"]:
         q = rearrange(self.q_proj(x), "b s (h d) -> b h s d", h=self.n_heads)
         k = rearrange(self.k_proj(x), "b s (h d) -> b h s d", h=self.n_heads)
         v = rearrange(self.v_proj(x), "b s (h d) -> b h s d", h=self.n_heads)
@@ -141,10 +149,65 @@ class SA(nn.Module):
         attn_scores = einsum(q, k, "b h s_q d, b h s_k d -> b h s_q s_k") / math.sqrt(
             self.head_dim
         )
-        attn_probs = self.drop1(F.softmax(attn_scores, dim=-1))
+        expanded_mask = _expand_attention_mask(key_padding_mask, target_length=x.shape[1])
+        if expanded_mask is not None:
+            attn_scores = attn_scores.masked_fill(~expanded_mask, -1.0e9)
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        if expanded_mask is not None:
+            attn_probs = attn_probs * expanded_mask.to(dtype=attn_probs.dtype)
+        attn_probs = self.drop1(attn_probs)
         out = einsum(v, attn_probs, "b h s_k d, b h s_q s_k -> b h s_q d")
         out = rearrange(out, "b h s d -> b s (h d)")
-        return self.drop2(self.out_proj(out))
+        out = self.drop2(self.out_proj(out))
+        if key_padding_mask is not None:
+            out = out * key_padding_mask.unsqueeze(-1).to(dtype=out.dtype)
+        return out
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.d_model = config.d_model
+        self.n_heads = config.n_heads
+        self.head_dim = config.head_dim
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.drop1 = nn.Dropout(config.dropout)
+        self.drop2 = nn.Dropout(config.dropout)
+        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+
+    def forward(
+        self,
+        queries: Float[Tensor, "b q d"],
+        context: Float[Tensor, "b s d"],
+        *,
+        query_mask: Tensor | None = None,
+        context_mask: Tensor | None = None,
+    ) -> Float[Tensor, "b q d"]:
+        if context.shape[1] == 0:
+            return torch.zeros_like(queries)
+
+        q = rearrange(self.q_proj(queries), "b s (h d) -> b h s d", h=self.n_heads)
+        k = rearrange(self.k_proj(context), "b s (h d) -> b h s d", h=self.n_heads)
+        v = rearrange(self.v_proj(context), "b s (h d) -> b h s d", h=self.n_heads)
+
+        attn_scores = einsum(q, k, "b h s_q d, b h s_k d -> b h s_q s_k") / math.sqrt(
+            self.head_dim
+        )
+        expanded_mask = _expand_attention_mask(context_mask, target_length=queries.shape[1])
+        if expanded_mask is not None:
+            attn_scores = attn_scores.masked_fill(~expanded_mask, -1.0e9)
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        if expanded_mask is not None:
+            attn_probs = attn_probs * expanded_mask.to(dtype=attn_probs.dtype)
+        attn_probs = self.drop1(attn_probs)
+        out = einsum(v, attn_probs, "b h s_k d, b h s_q s_k -> b h s_q d")
+        out = rearrange(out, "b h s d -> b s (h d)")
+        out = self.drop2(self.out_proj(out))
+        if query_mask is not None:
+            out = out * query_mask.unsqueeze(-1).to(dtype=out.dtype)
+        return out
 
 
 class FFN(nn.Module):
@@ -161,57 +224,108 @@ class FFN(nn.Module):
         return self.net(x)
 
 
-class TransformerBlock(nn.Module):
+class EncoderBlock(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
-        self.self_attention = SA(config)
+        self.self_attention = SelfAttention(config)
         self.ln_sa = nn.LayerNorm(config.d_model)
         self.ln_ffn = nn.LayerNorm(config.d_model)
         self.ffn = FFN(config)
 
-    def forward(self, x: Float[Tensor, "b s d"]) -> Float[Tensor, "b s d"]:
-        out = x + self.self_attention(self.ln_sa(x))
-        return out + self.ffn(self.ln_ffn(out))
+    def forward(
+        self,
+        x: Float[Tensor, "b s d"],
+        attention_mask: Tensor | None = None,
+    ) -> Float[Tensor, "b s d"]:
+        out = x + self.self_attention(self.ln_sa(x), key_padding_mask=attention_mask)
+        out = out + self.ffn(self.ln_ffn(out))
+        if attention_mask is not None:
+            out = out * attention_mask.unsqueeze(-1).to(dtype=out.dtype)
+        return out
+
+
+class PredictorBlock(nn.Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.self_attention = SelfAttention(config)
+        self.cross_attention = CrossAttention(config)
+        self.ln_sa = nn.LayerNorm(config.d_model)
+        self.ln_ca = nn.LayerNorm(config.d_model)
+        self.ln_ffn = nn.LayerNorm(config.d_model)
+        self.ffn = FFN(config)
+
+    def forward(
+        self,
+        queries: Float[Tensor, "b q d"],
+        context: Float[Tensor, "b s d"],
+        *,
+        query_mask: Tensor | None = None,
+        context_mask: Tensor | None = None,
+    ) -> Float[Tensor, "b q d"]:
+        out = queries + self.self_attention(self.ln_sa(queries), key_padding_mask=query_mask)
+        out = out + self.cross_attention(
+            self.ln_ca(out),
+            context,
+            query_mask=query_mask,
+            context_mask=context_mask,
+        )
+        out = out + self.ffn(self.ln_ffn(out))
+        if query_mask is not None:
+            out = out * query_mask.unsqueeze(-1).to(dtype=out.dtype)
+        return out
 
 
 class Encoder(nn.Module):
-    def __init__(
-        self,
-        config: TransformerConfig,
-        representation: SudokuRepresentation | None = None,
-        embedding: nn.Module | None = None,
-    ):
+    def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
-        if representation is None and embedding is None:
-            raise ValueError("Pass a shared representation instance.")
-        if representation is not None and embedding is not None:
-            raise ValueError("Pass either representation or embedding, not both.")
-
-        token_source = representation if representation is not None else embedding
-        assert token_source is not None
-        if hasattr(token_source, "d_model") and token_source.d_model != config.d_model:
-            raise ValueError(
-                f"Representation dim ({token_source.d_model}) must match model d_model ({config.d_model})."
-            )
-        if hasattr(token_source, "config") and token_source.config.dim != config.d_model:
-            raise ValueError(
-                f"Embedding dim ({token_source.config.dim}) must match model d_model ({config.d_model})."
-            )
-
-        self.representation = token_source
-        self.embedding = token_source
-        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
+        self.blocks = nn.ModuleList([EncoderBlock(config) for _ in range(config.n_layers)])
         self.drop = nn.Dropout(config.dropout)
         self.out_ln = nn.LayerNorm(config.d_model)
         self.head = nn.Linear(config.d_model, config.d_model, bias=False)
 
-    def forward(self, x: Float[Tensor, "b s 3"]) -> Float[Tensor, "b s d"]:
-        if hasattr(self.representation, "encode_board"):
-            tokens = self.representation.encode_board(x)
-        else:
-            tokens = self.representation(x)
+    def forward(
+        self,
+        tokens: Float[Tensor, "b s d"],
+        attention_mask: Tensor | None = None,
+    ) -> Float[Tensor, "b s d"]:
         out = self.drop(tokens * math.sqrt(self.config.d_model))
         for block in self.blocks:
-            out = block(out)
-        return self.head(self.out_ln(out))
+            out = block(out, attention_mask=attention_mask)
+        out = self.head(self.out_ln(out))
+        if attention_mask is not None:
+            out = out * attention_mask.unsqueeze(-1).to(dtype=out.dtype)
+        return out
+
+
+class Predictor(nn.Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.blocks = nn.ModuleList([PredictorBlock(config) for _ in range(config.n_layers)])
+        self.query_drop = nn.Dropout(config.dropout)
+        self.context_drop = nn.Dropout(config.dropout)
+        self.out_ln = nn.LayerNorm(config.d_model)
+        self.head = nn.Linear(config.d_model, config.d_model, bias=False)
+
+    def forward(
+        self,
+        encoded_context: Float[Tensor, "b s d"],
+        query_tokens: Float[Tensor, "b q d"],
+        *,
+        context_mask: Tensor | None = None,
+        query_mask: Tensor | None = None,
+    ) -> Float[Tensor, "b q d"]:
+        context = self.context_drop(encoded_context)
+        queries = self.query_drop(query_tokens * math.sqrt(self.config.d_model))
+        for block in self.blocks:
+            queries = block(
+                queries,
+                context,
+                query_mask=query_mask,
+                context_mask=context_mask,
+            )
+        out = self.head(self.out_ln(queries))
+        if query_mask is not None:
+            out = out * query_mask.unsqueeze(-1).to(dtype=out.dtype)
+        return out

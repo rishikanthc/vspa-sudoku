@@ -22,7 +22,7 @@ def main(config: DictConfig) -> None:
         )
         if metric.example_failed_board is not None:
             print(f"example_failed_board empty_cells={metric.empty_cells}")
-            print(format_sudoku_board(metric.example_failed_board))
+            print(format_sudoku_board(metric.example_failed_board, metric.example_failed_solution))
         if metric.example_failed_confidence is not None:
             print(f"example_failed_confidence empty_cells={metric.empty_cells}")
             print(format_confidence_board(metric.example_failed_confidence))

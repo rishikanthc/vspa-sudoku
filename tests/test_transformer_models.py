@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from jepa_sudoku.model.models import Encoder, SudokuRepresentation, TransformerConfig
+from jepa_sudoku.model.models import Encoder, Predictor, SudokuRepresentation, TransformerConfig
 
 
-def _build_components() -> tuple[SudokuRepresentation, Encoder]:
+def _build_components() -> tuple[SudokuRepresentation, Encoder, Predictor]:
     config = TransformerConfig(
         context_size=81,
         n_heads=2,
@@ -15,31 +15,41 @@ def _build_components() -> tuple[SudokuRepresentation, Encoder]:
         dropout=0.0,
     )
     representation = SudokuRepresentation(d_model=config.d_model, seed=123)
-    encoder = Encoder(config, representation=representation)
-    return representation, encoder
+    encoder = Encoder(config)
+    predictor = Predictor(config)
+    return representation, encoder, predictor
 
 
-def test_representation_encodes_empty_cells_as_coordinates_only() -> None:
-    representation, _ = _build_components()
-    board = torch.tensor([[[1.0, 1.0, 0.0], [1.0, 2.0, 7.0]]])
+def test_representation_encodes_bound_cell_vectors() -> None:
+    representation, _, _ = _build_components()
+    board = torch.tensor([[[1.0, 1.0, 4.0], [1.0, 2.0, 7.0]]])
 
     encoded = representation.encode_board(board)
     coords = representation.encode_coordinates(board)
     targets = representation.encode_targets(board)
 
-    assert torch.allclose(encoded[:, :1], coords[:, :1], atol=1e-6)
-    assert torch.allclose(encoded[:, 1:], targets[:, 1:], atol=1e-6)
+    assert encoded.shape == (1, 2, representation.d_model)
+    assert not torch.allclose(encoded, coords, atol=1e-6)
+    assert torch.allclose(encoded, targets, atol=1e-6)
 
 
-def test_encoder_outputs_full_board_vectors_and_decodes_digits() -> None:
-    representation, encoder = _build_components()
-    board = torch.zeros(2, 81, 3)
-    xy = torch.cartesian_prod(torch.arange(1, 10), torch.arange(1, 10)).float()
-    board[:, :, :2] = xy
-    board[:, :, 2] = 0
+def test_encoder_and_predictor_match_sparse_contract() -> None:
+    representation, encoder, predictor = _build_components()
+    puzzle = torch.tensor(
+        [[[1.0, 1.0, 5.0], [1.0, 2.0, 3.0], [1.0, 3.0, 7.0]]],
+        dtype=torch.float32,
+    )
+    queries = torch.tensor(
+        [[[1.0, 4.0], [1.0, 5.0]]],
+        dtype=torch.float32,
+    )
 
-    encoded = encoder(board)
-    logits = representation.logits_from_predictions(representation.encode_targets(board + torch.tensor([0.0, 0.0, 1.0])), board)
+    puzzle_vectors = representation.encode_board(puzzle)
+    query_vectors = representation.encode_coordinates(queries)
+    encoded = encoder(puzzle_vectors)
+    predicted = predictor(encoded, query_vectors)
+    logits = representation.logits_from_predictions(predicted, queries)
 
-    assert encoded.shape == (2, 81, representation.d_model)
-    assert logits.shape == (2, 81, 9)
+    assert encoded.shape == (1, 3, representation.d_model)
+    assert predicted.shape == (1, 2, representation.d_model)
+    assert logits.shape == (1, 2, 9)

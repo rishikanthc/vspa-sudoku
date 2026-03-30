@@ -5,16 +5,24 @@ defaults:
 seed: 123
 
 ssp:
-  dim: 512
+  dim: 1024
   seed: 42
 
 model:
-  context_size: 81
-  n_heads: 2
-  head_dim: 256
-  n_layers: 8
-  d_ff: 512
-  dropout: 0.1
+  encoder:
+    context_size: 81
+    n_heads: 4
+    head_dim: 256
+    n_layers: 16
+    d_ff: 1024
+    dropout: 0.1
+  predictor:
+    context_size: 81
+    n_heads: 4
+    head_dim: 256
+    n_layers: 4
+    d_ff: 1024
+    dropout: 0.1
 
 data:
   num_samples: 4500000

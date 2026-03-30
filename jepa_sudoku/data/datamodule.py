@@ -91,9 +91,9 @@ def select_solution_subset(solution_boards: Tensor, num_samples: int) -> Tensor:
 class SudokuPuzzleDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     """
     Dataset yielding:
-      - puzzle: (81, 3) full board [x, y, z], with z=0 for empty cells
-      - target: (81, 3) full solved board [x, y, z]
-      - mask:   (81, 3) boolean clue mask, True where the puzzle already contains a digit
+      - puzzle:   (N, 3) given cells [x, y, z]
+      - target:   (81 - N, 3) solved values for empty cells [x, y, z]
+      - queries:  (81 - N, 2) empty-cell coordinates [x, y]
     """
 
     def __init__(
@@ -210,17 +210,18 @@ class SudokuPuzzleDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
             puzzle_values[masked_indices] = 0.0
 
         clue_mask = puzzle_values.ne(0.0)
+        empty_mask = ~clue_mask
 
-        puzzle = torch.empty((81, 3), dtype=torch.float32)
-        puzzle[:, :2] = self._xy
-        puzzle[:, 2] = puzzle_values
+        puzzle = torch.empty((int(clue_mask.sum().item()), 3), dtype=torch.float32)
+        puzzle[:, :2] = self._xy[clue_mask]
+        puzzle[:, 2] = puzzle_values[clue_mask]
 
-        target = torch.empty((81, 3), dtype=torch.float32)
-        target[:, :2] = self._xy
-        target[:, 2] = solution_values
+        target = torch.empty((int(empty_mask.sum().item()), 3), dtype=torch.float32)
+        target[:, :2] = self._xy[empty_mask]
+        target[:, 2] = solution_values[empty_mask]
 
-        mask = clue_mask.unsqueeze(-1).expand(-1, 3).clone()
-        return puzzle, target, mask
+        queries = self._xy[empty_mask].clone()
+        return puzzle, target, queries
 
 
 class SudokuDataModule:

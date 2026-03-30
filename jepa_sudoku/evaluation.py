@@ -6,12 +6,11 @@ from pathlib import Path
 import torch
 from omegaconf import DictConfig
 from torch import Tensor
-from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from jepa_sudoku.data.datamodule import SudokuPuzzleDataset, load_precomputed_solutions
-from jepa_sudoku.model.models import Encoder, SudokuRepresentation
+from jepa_sudoku.model.models import Encoder, Predictor, SudokuRepresentation
 from jepa_sudoku.training.experiments import build_components
 
 
@@ -22,6 +21,7 @@ class DifficultyMetrics:
     board_solved_rate: float
     unsolved_board_count: int
     example_failed_board: Tensor | None = None
+    example_failed_solution: Tensor | None = None
     example_failed_confidence: Tensor | None = None
 
 
@@ -55,10 +55,10 @@ def _checkpoint_state_dict(checkpoint_path: str) -> dict[str, Tensor]:
     return state_dict
 
 
-def load_encoder_from_checkpoint(
+def load_modules_from_checkpoint(
     config: DictConfig,
-) -> tuple[SudokuRepresentation, Encoder]:
-    representation, encoder = build_components(config)
+) -> tuple[SudokuRepresentation, Encoder, Predictor]:
+    representation, encoder, predictor = build_components(config)
     state_dict = _checkpoint_state_dict(config.evaluation.checkpoint_path)
 
     encoder_state = {
@@ -66,19 +66,32 @@ def load_encoder_from_checkpoint(
         for key, value in state_dict.items()
         if key.startswith("encoder.")
     }
-    if not encoder_state:
-        raise ValueError("Checkpoint does not contain encoder weights.")
-    missing, unexpected = encoder.load_state_dict(encoder_state, strict=True)
-    if missing or unexpected:
-        raise RuntimeError(
-            f"Unexpected encoder state load result. missing={missing}, unexpected={unexpected}"
-        )
-
+    predictor_state = {
+        key.removeprefix("predictor."): value
+        for key, value in state_dict.items()
+        if key.startswith("predictor.")
+    }
     repr_state = {
         key.removeprefix("representation."): value
         for key, value in state_dict.items()
         if key.startswith("representation.")
     }
+
+    if not encoder_state:
+        raise ValueError("Checkpoint does not contain encoder weights.")
+    if not predictor_state:
+        raise ValueError("Checkpoint does not contain predictor weights.")
+
+    missing, unexpected = encoder.load_state_dict(encoder_state, strict=True)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Unexpected encoder state load result. missing={missing}, unexpected={unexpected}"
+        )
+    missing, unexpected = predictor.load_state_dict(predictor_state, strict=True)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Unexpected predictor state load result. missing={missing}, unexpected={unexpected}"
+        )
     missing, unexpected = representation.load_state_dict(repr_state, strict=True)
     if missing or unexpected:
         raise RuntimeError(
@@ -86,8 +99,9 @@ def load_encoder_from_checkpoint(
         )
 
     encoder.eval()
+    predictor.eval()
     representation.eval()
-    return representation, encoder
+    return representation, encoder, predictor
 
 
 def _group_indices() -> list[Tensor]:
@@ -132,10 +146,10 @@ def find_constraint_violations(board_digits: Tensor) -> Tensor:
     violations = torch.zeros_like(board_digits, dtype=torch.bool)
     for indices in GROUP_INDICES:
         group = board_digits[:, indices]
-        one_hot = F.one_hot(group.clamp(min=0), num_classes=10)[..., 1:].to(dtype=torch.bool)
-        duplicate_digits = one_hot.sum(dim=1) > 1
-        group_violations = (one_hot & duplicate_digits.unsqueeze(1)).any(dim=-1)
-        violations[:, indices] |= group_violations
+        for digit in range(1, 10):
+            duplicate_mask = group.eq(digit)
+            has_duplicate = duplicate_mask.sum(dim=1) > 1
+            violations[:, indices] |= duplicate_mask & has_duplicate.unsqueeze(1)
     return violations
 
 
@@ -170,79 +184,20 @@ def _allowed_digits(board_digits: Tensor, index: int, component_set: set[int]) -
     return [digit for digit in range(1, 10) if digit not in used]
 
 
-def _search_component_assignment(
-    board_digits: Tensor,
-    logits: Tensor,
-    component: list[int],
-    max_candidates_per_cell: int,
-) -> dict[int, int] | None:
-    if max_candidates_per_cell <= 0:
-        raise ValueError("evaluation.local_repair.max_candidates_per_cell must be positive")
-
-    component_set = set(component)
-    candidate_map: dict[int, list[int]] = {}
-    score_map: dict[tuple[int, int], float] = {}
-    for index in component:
-        candidates = _allowed_digits(board_digits, index, component_set)
-        if not candidates:
-            return None
-        ranked = sorted(
-            candidates,
-            key=lambda digit: float(logits[index, digit - 1].item()),
-            reverse=True,
-        )
-        candidate_map[index] = ranked[:max_candidates_per_cell]
-        for digit in candidate_map[index]:
-            score_map[(index, digit)] = float(logits[index, digit - 1].item())
-
-    ordered = sorted(component, key=lambda idx: (len(candidate_map[idx]), idx))
-    best_assignment: dict[int, int] | None = None
-    best_score = float("-inf")
-    assignment: dict[int, int] = {}
-
-    suffix_upper_bounds = [0.0 for _ in range(len(ordered) + 1)]
-    for pos in range(len(ordered) - 1, -1, -1):
-        index = ordered[pos]
-        suffix_upper_bounds[pos] = suffix_upper_bounds[pos + 1] + max(
-            score_map[(index, digit)] for digit in candidate_map[index]
-        )
-
-    def backtrack(position: int, current_score: float) -> None:
-        nonlocal best_assignment, best_score
-        if position == len(ordered):
-            if current_score > best_score:
-                best_score = current_score
-                best_assignment = assignment.copy()
-            return
-
-        if current_score + suffix_upper_bounds[position] <= best_score:
-            return
-
-        index = ordered[position]
-        for digit in candidate_map[index]:
-            valid = True
-            for neighbor in CELL_NEIGHBORS[index]:
-                if assignment.get(neighbor) == digit:
-                    valid = False
-                    break
-            if not valid:
-                continue
-            assignment[index] = digit
-            backtrack(position + 1, current_score + score_map[(index, digit)])
-            del assignment[index]
-
-    backtrack(0, 0.0)
-    return best_assignment
-
-
-def repair_conflict_clusters(
+def jointly_decode_conflict_groups(
     board_digits: Tensor,
     logits: Tensor,
     original_clues: Tensor,
     violations: Tensor,
-    max_component_size: int,
-    max_candidates_per_cell: int,
+    *,
+    max_component_size: int = 6,
+    top_k_per_cell: int = 4,
 ) -> Tensor:
+    if max_component_size <= 0:
+        raise ValueError("max_component_size must be positive.")
+    if top_k_per_cell <= 0:
+        raise ValueError("top_k_per_cell must be positive.")
+
     repaired = board_digits.clone()
     conflict_indices = torch.nonzero(violations & ~original_clues, as_tuple=False).reshape(-1).tolist()
     if not conflict_indices:
@@ -251,67 +206,179 @@ def repair_conflict_clusters(
     for component in _conflict_components(conflict_indices):
         if len(component) > max_component_size:
             continue
-        assignment = _search_component_assignment(
-            repaired,
-            logits,
-            component,
-            max_candidates_per_cell=max_candidates_per_cell,
-        )
-        if assignment is None:
+
+        component_set = set(component)
+        candidate_map: dict[int, list[int]] = {}
+        score_map: dict[tuple[int, int], float] = {}
+        for index in component:
+            candidates = _allowed_digits(repaired, index, component_set)
+            if not candidates:
+                candidate_map = {}
+                break
+            ranked = sorted(
+                candidates,
+                key=lambda digit: float(logits[index, digit - 1].item()),
+                reverse=True,
+            )
+            candidate_map[index] = ranked[:top_k_per_cell]
+            for digit in candidate_map[index]:
+                score_map[(index, digit)] = float(logits[index, digit - 1].item())
+        if not candidate_map:
             continue
-        for index, digit in assignment.items():
+
+        ordered = sorted(component, key=lambda idx: (len(candidate_map[idx]), idx))
+        suffix_upper_bounds = [0.0 for _ in range(len(ordered) + 1)]
+        for pos in range(len(ordered) - 1, -1, -1):
+            index = ordered[pos]
+            suffix_upper_bounds[pos] = suffix_upper_bounds[pos + 1] + max(
+                score_map[(index, digit)] for digit in candidate_map[index]
+            )
+
+        best_assignment: dict[int, int] | None = None
+        best_score = float("-inf")
+        assignment: dict[int, int] = {}
+
+        def backtrack(position: int, current_score: float) -> None:
+            nonlocal best_assignment, best_score
+            if position == len(ordered):
+                if current_score > best_score:
+                    best_score = current_score
+                    best_assignment = assignment.copy()
+                return
+
+            if current_score + suffix_upper_bounds[position] <= best_score:
+                return
+
+            index = ordered[position]
+            for digit in candidate_map[index]:
+                valid = True
+                for neighbor in CELL_NEIGHBORS[index]:
+                    if assignment.get(neighbor) == digit:
+                        valid = False
+                        break
+                if not valid:
+                    continue
+                assignment[index] = digit
+                backtrack(position + 1, current_score + score_map[(index, digit)])
+                del assignment[index]
+
+        backtrack(0, 0.0)
+        if best_assignment is None:
+            continue
+        for index, digit in best_assignment.items():
             repaired[index] = digit
+
     return repaired
+
+
+def _pad_context_from_board(board: Tensor) -> tuple[Tensor, Tensor]:
+    context_lengths = board[..., 2].ne(0).sum(dim=1)
+    max_context = int(context_lengths.max().item())
+    batch_size = board.shape[0]
+    device = board.device
+    dtype = board.dtype
+
+    padded = torch.zeros((batch_size, max_context, 3), device=device, dtype=dtype)
+    mask = torch.zeros((batch_size, max_context), device=device, dtype=torch.bool)
+
+    for batch_idx in range(batch_size):
+        context = board[batch_idx, board[batch_idx, :, 2].ne(0)]
+        length = context.shape[0]
+        if length == 0:
+            continue
+        padded[batch_idx, :length] = context
+        mask[batch_idx, :length] = True
+    return padded, mask
 
 
 def infer_filled_board(
     encoder: Encoder,
+    predictor: Predictor,
     representation: SudokuRepresentation,
-    puzzle: Tensor,
+    current_board: Tensor,
+    query_coordinates: Tensor,
     temperature: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
     if temperature <= 0.0:
         raise ValueError("evaluation.inference.temperature must be positive")
 
-    encoded = encoder(puzzle)
-    coord_vecs = representation.encode_coordinates(puzzle)
-    digit_estimate = torch.nn.functional.normalize(encoded * coord_vecs, dim=-1)
-    prototypes = torch.nn.functional.normalize(
-        representation.digit_prototypes().to(digit_estimate.device),
-        dim=-1,
+    context_xyz, context_mask = _pad_context_from_board(current_board)
+    context_tokens = torch.zeros(
+        (current_board.shape[0], context_xyz.shape[1], representation.d_model),
+        device=current_board.device,
+        dtype=current_board.dtype,
     )
-    logits = torch.einsum("bsd,vd->bsv", digit_estimate, prototypes) / temperature
+    for batch_idx in range(current_board.shape[0]):
+        length = int(context_mask[batch_idx].sum().item())
+        if length == 0:
+            continue
+        context_tokens[batch_idx, :length] = representation.encode_board(
+            context_xyz[batch_idx : batch_idx + 1, :length]
+        )[0]
+    encoded_context = encoder(context_tokens, attention_mask=context_mask)
+    query_tokens = representation.encode_coordinates(query_coordinates)
+    predicted_vectors = predictor(
+        encoded_context,
+        query_tokens,
+        context_mask=context_mask,
+    )
+
+    logits = representation.logits_from_predictions(predicted_vectors, query_coordinates) / temperature
     probs = torch.softmax(logits, dim=-1)
     confidence = probs.amax(dim=-1)
-    pred_digits = logits.argmax(dim=-1).to(dtype=puzzle.dtype) + 1.0
-    filled = puzzle.clone()
-    empty_mask = filled[..., 2].eq(0)
-    filled[..., 2] = torch.where(empty_mask, pred_digits, filled[..., 2])
-    prediction_confidence = torch.where(
-        empty_mask,
-        confidence.to(dtype=puzzle.dtype),
-        torch.full_like(confidence, float("nan"), dtype=puzzle.dtype),
+    pred_digits = logits.argmax(dim=-1).to(dtype=current_board.dtype) + 1.0
+
+    filled = current_board.clone()
+    filled[..., 2] = filled[..., 2].scatter(1, _query_indices(query_coordinates, current_board.device), pred_digits)
+
+    full_confidence = torch.full_like(current_board[..., 2], float("nan"))
+    full_confidence = full_confidence.scatter(
+        1,
+        _query_indices(query_coordinates, current_board.device),
+        confidence.to(dtype=full_confidence.dtype),
     )
-    return filled, prediction_confidence, logits
+    return filled, full_confidence, logits
+
+
+def _query_indices(query_coordinates: Tensor, device: torch.device) -> Tensor:
+    x = query_coordinates[..., 0].to(dtype=torch.long) - 1
+    y = query_coordinates[..., 1].to(dtype=torch.long) - 1
+    return (x * 9 + y).to(device=device)
+
+
+def _scatter_query_logits_to_board(logits: Tensor, query_coordinates: Tensor) -> Tensor:
+    board_logits = torch.full(
+        (logits.shape[0], 81, logits.shape[-1]),
+        float("-inf"),
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    query_indices = _query_indices(query_coordinates, logits.device)
+    board_logits.scatter_(
+        1,
+        query_indices.unsqueeze(-1).expand(-1, -1, logits.shape[-1]),
+        logits,
+    )
+    return board_logits
 
 
 def run_multi_pass_inference(
     encoder: Encoder,
+    predictor: Predictor,
     representation: SudokuRepresentation,
     puzzle: Tensor,
-    clue_mask: Tensor,
+    query_coordinates: Tensor,
     max_passes: int,
     temperature: float,
-    repair_enabled: bool,
-    repair_max_component_size: int,
-    repair_max_candidates_per_cell: int,
+    joint_decode_max_component_size: int = 10,
+    joint_decode_top_k_per_cell: int = 5,
     progress: tqdm | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, list[Tensor], list[Tensor], list[Tensor]]:
     if max_passes <= 0:
         raise ValueError("evaluation.inference.max_passes must be positive")
 
     current_puzzle = puzzle.clone()
-    original_clues = clue_mask[..., 0].to(dtype=torch.bool)
+    original_clues = puzzle[..., 2].ne(0)
     final_board = current_puzzle.clone()
     final_confidence = torch.full_like(puzzle[..., 2], float("nan"))
     solved = torch.zeros(puzzle.shape[0], dtype=torch.bool, device=puzzle.device)
@@ -322,26 +389,29 @@ def run_multi_pass_inference(
     for pass_idx in range(max_passes):
         final_board, final_confidence, logits = infer_filled_board(
             encoder,
+            predictor,
             representation,
             current_puzzle,
+            query_coordinates,
             temperature,
         )
+        board_logits = _scatter_query_logits_to_board(logits, query_coordinates)
         digits = final_board[..., 2].to(dtype=torch.long)
         violations = find_constraint_violations(digits)
-        if repair_enabled:
+        if violations.any():
             repaired_digits = digits.clone()
             for board_idx in range(repaired_digits.shape[0]):
-                repaired_digits[board_idx] = repair_conflict_clusters(
-                    board_digits=repaired_digits[board_idx],
-                    logits=logits[board_idx],
-                    original_clues=original_clues[board_idx],
-                    violations=violations[board_idx],
-                    max_component_size=repair_max_component_size,
-                    max_candidates_per_cell=repair_max_candidates_per_cell,
+                repaired_digits[board_idx] = jointly_decode_conflict_groups(
+                    repaired_digits[board_idx],
+                    board_logits[board_idx],
+                    original_clues[board_idx],
+                    violations[board_idx],
+                    max_component_size=joint_decode_max_component_size,
+                    top_k_per_cell=joint_decode_top_k_per_cell,
                 )
             final_board = final_board.clone()
             final_board[..., 2] = repaired_digits.to(dtype=final_board.dtype)
-            digits = final_board[..., 2].to(dtype=torch.long)
+            digits = repaired_digits
             violations = find_constraint_violations(digits)
         solved = digits.ne(0).all(dim=-1) & ~violations.any(dim=-1)
         board_history.append(final_board.clone())
@@ -366,13 +436,13 @@ def run_multi_pass_inference(
             final_board,
             updated,
         )
-
     return final_board, final_confidence, solved, board_history, confidence_history, solved_history
 
 
 def evaluate_difficulty(
     *,
     encoder: Encoder,
+    predictor: Predictor,
     representation: SudokuRepresentation,
     solutions: Tensor,
     empty_cells: int,
@@ -382,9 +452,8 @@ def evaluate_difficulty(
     seed: int,
     max_passes: int,
     temperature: float,
-    repair_enabled: bool,
-    repair_max_component_size: int,
-    repair_max_candidates_per_cell: int,
+    joint_decode_max_component_size: int,
+    joint_decode_top_k_per_cell: int,
     device: torch.device,
 ) -> DifficultyMetrics:
     dataset = SudokuPuzzleDataset(
@@ -407,6 +476,7 @@ def evaluate_difficulty(
     total_sum = 0.0
     solved_sum = 0.0
     example_failed_board: Tensor | None = None
+    example_failed_solution: Tensor | None = None
     example_failed_confidence: Tensor | None = None
     pass_correct_sum = [0.0 for _ in range(max_passes)]
     pass_total_sum = [0.0 for _ in range(max_passes)]
@@ -421,31 +491,41 @@ def evaluate_difficulty(
     )
 
     with torch.no_grad():
-        for puzzle, target, clue_mask in loader:
+        for puzzle, target, queries in loader:
             puzzle = puzzle.to(device)
             target = target.to(device)
-            clue_mask = clue_mask.to(device)
+            queries = queries.to(device)
+
+            full_puzzle = torch.zeros((puzzle.shape[0], 81, 3), device=device, dtype=puzzle.dtype)
+            xy = torch.cartesian_prod(
+                torch.arange(1, 10, device=device),
+                torch.arange(1, 10, device=device),
+            ).to(dtype=puzzle.dtype)
+            full_puzzle[:, :, :2] = xy
+            puzzle_indices = _query_indices(puzzle[..., :2], device) if puzzle.shape[1] > 0 else torch.empty((puzzle.shape[0], 0), dtype=torch.long, device=device)
+            target_indices = _query_indices(target[..., :2], device)
+            if puzzle.shape[1] > 0:
+                full_puzzle[..., 2].scatter_(1, puzzle_indices, puzzle[..., 2])
 
             final_board, final_confidence, solved, board_history, confidence_history, solved_history = run_multi_pass_inference(
                 encoder=encoder,
+                predictor=predictor,
                 representation=representation,
-                puzzle=puzzle,
-                clue_mask=clue_mask,
+                puzzle=full_puzzle,
+                query_coordinates=queries,
                 max_passes=max_passes,
                 temperature=temperature,
-                repair_enabled=repair_enabled,
-                repair_max_component_size=repair_max_component_size,
-                repair_max_candidates_per_cell=repair_max_candidates_per_cell,
+                joint_decode_max_component_size=joint_decode_max_component_size,
+                joint_decode_top_k_per_cell=joint_decode_top_k_per_cell,
                 progress=progress,
             )
 
-            eval_mask = ~clue_mask[..., 0].to(dtype=torch.bool)
-            pred_digits = final_board[..., 2].to(dtype=torch.long)
+            pred_digits = final_board[..., 2].gather(1, target_indices).to(dtype=torch.long)
             target_digits = target[..., 2].to(dtype=torch.long)
-            correct = pred_digits.eq(target_digits) & eval_mask
+            correct = pred_digits.eq(target_digits)
 
             correct_sum += float(correct.sum().item())
-            total_sum += float(eval_mask.sum().item())
+            total_sum += float(target_digits.numel())
             solved_sum += float(solved.sum().item())
 
             if example_failed_board is None:
@@ -453,17 +533,20 @@ def evaluate_difficulty(
                 if failed_indices.numel() > 0:
                     failed_idx = int(failed_indices[0].item())
                     example_failed_board = final_board[failed_idx].detach().cpu()
-                    # Show confidence from the first pass over the original puzzle,
-                    # so every originally empty cell has a confidence value.
+                    solved_board = torch.zeros_like(final_board[failed_idx])
+                    solved_board[:, :2] = final_board[failed_idx, :, :2]
+                    solved_board[:, 2] = final_board[failed_idx, :, 2]
+                    solved_board[target_indices[failed_idx], 2] = target[failed_idx, :, 2]
+                    example_failed_solution = solved_board.detach().cpu()
                     example_failed_confidence = confidence_history[0][failed_idx].detach().cpu()
 
             for pass_idx, (pass_board, pass_solved) in enumerate(
                 zip(board_history, solved_history, strict=True)
             ):
-                pass_pred_digits = pass_board[..., 2].to(dtype=torch.long)
-                pass_correct = pass_pred_digits.eq(target_digits) & eval_mask
+                pass_pred_digits = pass_board[..., 2].gather(1, target_indices).to(dtype=torch.long)
+                pass_correct = pass_pred_digits.eq(target_digits)
                 pass_correct_sum[pass_idx] += float(pass_correct.sum().item())
-                pass_total_sum[pass_idx] += float(eval_mask.sum().item())
+                pass_total_sum[pass_idx] += float(target_digits.numel())
                 pass_solved_sum[pass_idx] += float(pass_solved.sum().item())
 
     progress.close()
@@ -488,22 +571,40 @@ def evaluate_difficulty(
         board_solved_rate=board_solved_rate,
         unsolved_board_count=unsolved_board_count,
         example_failed_board=example_failed_board,
+        example_failed_solution=example_failed_solution,
         example_failed_confidence=example_failed_confidence,
     )
 
 
-def format_sudoku_board(board_xyz: Tensor) -> str:
+def format_sudoku_board(board_xyz: Tensor, solution_xyz: Tensor | None = None) -> str:
     if board_xyz.shape != (81, 3):
         raise ValueError(f"Expected board with shape (81, 3), got {tuple(board_xyz.shape)}.")
+    if solution_xyz is not None and solution_xyz.shape != (81, 3):
+        raise ValueError(
+            f"Expected solution with shape (81, 3), got {tuple(solution_xyz.shape)}."
+        )
 
     digits = board_xyz[:, 2].to(dtype=torch.long).reshape(9, 9)
+    solution_digits = (
+        solution_xyz[:, 2].to(dtype=torch.long).reshape(9, 9) if solution_xyz is not None else None
+    )
     lines = ["+-------+-------+-------+"]
     for row_idx in range(9):
-        row = [str(int(value.item())) if int(value.item()) != 0 else "." for value in digits[row_idx]]
+        row: list[str] = []
+        for col_idx, value in enumerate(digits[row_idx]):
+            digit = int(value.item())
+            cell = str(digit) if digit != 0 else "."
+            if solution_digits is not None:
+                solution_digit = int(solution_digits[row_idx, col_idx].item())
+                if digit != solution_digit:
+                    cell = f"[{cell}]"
+            row.append(cell)
         chunks = [" ".join(row[col:col + 3]) for col in range(0, 9, 3)]
         lines.append(f"| {' | '.join(chunks)} |")
         if (row_idx + 1) % 3 == 0:
             lines.append("+-------+-------+-------+")
+    if solution_digits is not None:
+        lines.append("Legend: cells in [brackets] differ from the solution.")
     return "\n".join(lines)
 
 
@@ -531,9 +632,10 @@ def evaluate_checkpoint(config: DictConfig) -> list[DifficultyMetrics]:
         dataset_path=config.evaluation.data.dataset_path,
         num_samples=config.evaluation.data.num_samples,
     )
-    representation, encoder = load_encoder_from_checkpoint(config)
+    representation, encoder, predictor = load_modules_from_checkpoint(config)
     representation.to(device)
     encoder.to(device)
+    predictor.to(device)
 
     metrics: list[DifficultyMetrics] = []
     difficulty_levels = build_difficulty_levels(config)
@@ -541,6 +643,7 @@ def evaluate_checkpoint(config: DictConfig) -> list[DifficultyMetrics]:
         metrics.append(
             evaluate_difficulty(
                 encoder=encoder,
+                predictor=predictor,
                 representation=representation,
                 solutions=solutions,
                 empty_cells=empty_cells,
@@ -550,9 +653,8 @@ def evaluate_checkpoint(config: DictConfig) -> list[DifficultyMetrics]:
                 seed=config.seed,
                 max_passes=config.evaluation.inference.max_passes,
                 temperature=config.evaluation.inference.temperature,
-                repair_enabled=config.evaluation.local_repair.enabled,
-                repair_max_component_size=config.evaluation.local_repair.max_component_size,
-                repair_max_candidates_per_cell=config.evaluation.local_repair.max_candidates_per_cell,
+                joint_decode_max_component_size=config.evaluation.joint_decoding.max_component_size,
+                joint_decode_top_k_per_cell=config.evaluation.joint_decoding.top_k_per_cell,
                 device=device,
             )
         )

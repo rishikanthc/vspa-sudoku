@@ -8,7 +8,7 @@ from torch import Tensor
 from torch.optim import Adam
 
 from jepa_sudoku.model.losses import masked_cosine_loss
-from jepa_sudoku.model.models import Encoder, SudokuRepresentation
+from jepa_sudoku.model.models import Encoder, Predictor, SudokuRepresentation
 
 
 @dataclass
@@ -27,14 +27,13 @@ class SudokuLightningModule(pl.LightningModule):
         self,
         *,
         encoder: Encoder,
+        predictor: Predictor,
         representation: SudokuRepresentation,
         config: LightningTrainConfig,
     ) -> None:
         super().__init__()
-        if encoder.representation is not representation:
-            raise ValueError("Pass the same representation instance used by the encoder.")
-
         self.encoder = encoder
+        self.predictor = predictor
         self.representation = representation
         self.config = config
         self.history: list[float] = []
@@ -42,22 +41,28 @@ class SudokuLightningModule(pl.LightningModule):
         self._curriculum_best_loss = float("inf")
 
     def configure_optimizers(self) -> Adam:
-        return Adam(self.encoder.parameters(), lr=self.config.learning_rate)
+        parameters = list(self.encoder.parameters()) + list(self.predictor.parameters())
+        return Adam(parameters, lr=self.config.learning_rate)
 
     def _shared_step(
         self, batch: tuple[Tensor, Tensor, Tensor]
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        puzzle, target, clue_mask = batch
-        optimize_mask = ~clue_mask[..., 0].to(dtype=torch.bool)
-        encoded = self.encoder(puzzle)
+        puzzle, target, queries = batch
+        puzzle_vectors = self.representation.encode_board(puzzle)
+        query_vectors = self.representation.encode_coordinates(queries)
         target_vectors = self.representation.encode_targets(target)
-        loss = masked_cosine_loss(encoded, target_vectors, optimize_mask)
+        encoded = self.encoder(puzzle_vectors)
+        predicted = self.predictor(encoded, query_vectors)
+        optimize_mask = torch.ones(
+            predicted.shape[:2], device=predicted.device, dtype=torch.bool
+        )
+        loss = masked_cosine_loss(predicted, target_vectors, optimize_mask)
 
-        pred_norm = torch.nn.functional.normalize(encoded, dim=-1)
+        pred_norm = torch.nn.functional.normalize(predicted, dim=-1)
         target_norm = torch.nn.functional.normalize(target_vectors, dim=-1)
         cosine_per_cell = (pred_norm * target_norm).sum(dim=-1)
 
-        logits = self.representation.logits_from_predictions(encoded, target)
+        logits = self.representation.logits_from_predictions(predicted, queries)
         pred_digits = logits.argmax(dim=-1) + 1
         target_digits = target[..., 2].to(dtype=torch.long)
         correct = pred_digits.eq(target_digits)
@@ -70,7 +75,7 @@ class SudokuLightningModule(pl.LightningModule):
         board_solved = torch.where(
             optimize_mask.any(dim=-1),
             correct.logical_or(~optimize_mask).all(dim=-1).to(dtype=encoded.dtype),
-            torch.ones(puzzle.shape[0], device=encoded.device, dtype=encoded.dtype),
+            torch.ones(puzzle.shape[0], device=predicted.device, dtype=predicted.dtype),
         ).mean()
         return loss, avg_cosine, avg_cell_accuracy, board_solved
 
@@ -82,7 +87,7 @@ class SudokuLightningModule(pl.LightningModule):
         empty_cells = (
             float(data_module.current_num_cells_to_mask)
             if data_module is not None
-            else float((~batch[2][..., 0].to(dtype=torch.bool)).sum(dim=-1).float().mean().item())
+            else float(batch[1].shape[1])
         )
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
