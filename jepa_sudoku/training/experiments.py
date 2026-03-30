@@ -220,8 +220,14 @@ def _history_from_callback_metrics(metrics: dict[str, Any]) -> list[float]:
 
 def run_training_experiment(config: DictConfig) -> ExperimentResult:
     torch.set_float32_matmul_precision(config.trainer.matmul_precision)
-    if config.trainer.suppress_accumulate_grad_stream_mismatch_warning:
-        torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+    graph_module = getattr(torch.autograd, "graph", None)
+    set_warn_fn = (
+        getattr(graph_module, "set_warn_on_accumulate_grad_stream_mismatch", None)
+        if graph_module is not None
+        else None
+    )
+    if config.trainer.suppress_accumulate_grad_stream_mismatch_warning and callable(set_warn_fn):
+        set_warn_fn(False)
     pl.seed_everything(config.seed, workers=True)
 
     data_module = build_data_module(config)

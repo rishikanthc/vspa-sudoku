@@ -13,7 +13,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "mlflow>=3.5.1",
     "pytest>=9.0.2",
-    "torch>=2.11.0",
+    "torch>=2.8.0,<2.9.0",
     "lightning>=2.6.1",
     "tqdm>=4.67.3",
 ]
